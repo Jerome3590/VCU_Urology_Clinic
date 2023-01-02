@@ -1,0 +1,273 @@
+---
+title: "Urology: ICD Code Market Basket Analysis"
+format:
+  html:
+    toc: true
+    df-print: paged
+    fontsize: "11pt"
+    embed-resources: true
+knitr:
+  opts_chunk: 
+    echo: false
+    message: false
+    warning: false
+    out.width: "80%"
+---
+
+```{r Load-Libraries, eval=TRUE, include=FALSE}
+
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(here)
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(networkD3)
+library(visNetwork)
+library(data.table)
+library(purrr)
+library(sparklyr)
+library(arrow)
+
+theme_set(theme_bw())
+
+```
+
+```{r load-apcd-data, message=FALSE, warning=FALSE, include=FALSE}
+
+# Load All Payers Claim Database (APCD) data
+
+urology <- read_csv(here("data","urology.csv"))
+
+```
+
+```{r format-data-for-market-basket-analysis, include=FALSE }
+
+# Structure Data for FpGrowth Algorithm
+
+urology_mb <- urology %>% 
+  mutate(ICD = str_replace_all(ICD, "Unknown:", "")) %>% 
+  ungroup() %>%
+  rowwise() %>% 
+  mutate(ICD_Codes = list(unique(unlist(strsplit(ICD, ":"))))) %>% 
+  select(-3)
+
+
+```
+
+```{r spark-session, include=FALSE, eval=TRUE, cache=TRUE}
+
+#Start Spark Session
+conf <- spark_config()
+sc <- spark_connect(master = "local")
+
+
+copy_to(
+  sc,
+  df=urology_mb,
+  overwrite = FALSE,
+  memory = TRUE,
+  repartition = 0L
+)
+
+# Create dplyr reference to Spark dataframe
+icd_urology <- tbl(sc, 'urology_mb')
+
+
+```
+
+<br>
+
+### FpGrowth Model Parameters
+
+```{r fpgrowth-parameters, echo=TRUE}
+
+min_conf = .15
+
+min_supp = .005
+
+# run the FPGrowth Algorithm
+fp_model_icd_urology <- ml_fpgrowth(icd_urology, min_confidence = min_conf, min_support = min_supp, items_col = "ICD_Codes", prediction_col = "prediction", uid = random_string("fpgrowth_")) 
+
+
+```
+
+<br>
+
+### Association Rules (If..Then)
+
+<font size="+2">
+
+Confidence: Percentage of cases in which the rule is correct Support: Percentage of how often rule occurs for all transactions Lift: The higher the value of lift, the higher the probability consequent occurs.
+
+</font>
+
+[Towards Data Science primer on Market Basket Analysis](https://towardsdatascience.com/association-rules-2-aa9a77241654)
+
+<hr >
+
+<br>
+
+```{r urology-icd-rules, eval=TRUE, echo=TRUE, include=TRUE}
+
+urology_icd_rules <- ml_association_rules(fp_model_icd_urology) %>% 
+  arrange(-lift) %>% 
+  collect()  %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate(antecedent = paste(antecedent, collapse = ':'),
+         consequent = paste(consequent, collapse = ':')) 
+
+urology_icd_rules %>% 
+  DT::datatable()
+
+
+```
+
+<br>
+
+### Itemsets (frequency of Urology ICD Code Sets)
+
+```{r urology-icd-itemsets, eval=TRUE, echo=TRUE, include=TRUE}
+
+urology_itemsets <- ml_freq_itemsets(fp_model_icd_urology) %>% 
+  arrange(-freq) %>% 
+  collect()  %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate(items = paste(items, collapse = ':'))
+
+urology_itemsets %>% 
+  DT::datatable()
+
+```
+
+```{r plot-function, include=FALSE}
+
+
+# Plot resulting rules in a networkgraph
+
+plot_rules = function(urology_assoc_rules, LHS = "antecedent", RHS = "consequent", cf = 0.15)
+{
+  rules = urology_assoc_rules %>% filter(confidence > cf)
+  nds = unique(
+    c(
+      rules[,LHS][[1]],
+      rules[,RHS][[1]]
+    )
+  )
+  
+  nodes = data.frame(id = nds, label = nds, title = nds) %>% arrange(id)
+  
+  edges = data.frame(
+    from =  rules[,LHS][[1]],
+    to = rules[,RHS][[1]]
+  )
+  visNetwork(nodes, edges, main = "Urology Market Basket Analysis", size=1) %>%
+    visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+    visEdges(smooth = FALSE) %>%
+    visPhysics(
+      solver = "barnesHut", 
+      forceAtlas2Based = list(gravitationalConstant = -20, maxVelocity = 1)
+    )
+}
+
+
+```
+
+### Urology ICD Code Network Analysis from APCD Data
+
+```{r urology-icd-network, include=FALSE}
+
+# extract association rules
+urology_assoc_rules <- ml_association_rules(fp_model_icd_urology) %>%
+  collect %>%
+  dplyr::mutate(antecedent = map_chr(antecedent, str_c, sep = " + ", collapse = " + ")) %>%
+  dplyr::mutate(consequent = map_chr(consequent, str_c, sep = " + ", collapse = " + "))
+
+
+# create the network visual using the nodes and links
+urology_network <- plot_rules(urology_assoc_rules)
+
+saveNetwork(urology_network, "urology_network.html", selfcontained = TRUE)
+
+
+
+```
+
+```{r plot-network, eval=TRUE, include=TRUE}
+
+plot_rules(urology_assoc_rules)
+
+```
+
+<hr>
+
+### Click below for full screen version of visual
+
+<font size="+2">
+
+[Urology ICD Code Network Analysis](https://plotly-demo.s3.amazonaws.com/urology_network.html) </font>
+
+<br>
+
+```{r format-for-aws-quicksight, include=FALSE, eval=FALSE}
+
+# Format for AWS QuickSight
+
+urology_itemsets_qs <- ml_freq_itemsets(fp_model_icd_urology)  %>%
+  dplyr::mutate(items = concat_ws(": ", items)) %>% 
+  sdf_register("urology_itemsets_qs")
+
+
+urology_icd_rules_qs <- ml_association_rules(fp_model_icd_urology) %>%
+  dplyr::mutate(antecedent = concat_ws(": ", antecedent)) %>%
+  dplyr::mutate(consequent = concat_ws(": ", consequent)) %>% 
+  unite("Network", c(1:2), sep = ": ", remove = TRUE) %>% 
+  sdf_register("urology_icd_rules_qs")
+  
+
+```
+
+```{r save-itemsets, eval=FALSE, include=FALSE}
+
+# Save to Data Lake
+
+spark_write_parquet(urology_itemsets_qs, path = 's3a://pgxdatalake/itemsets_icd/urology', mode = "overwrite", skipNul = TRUE)
+
+
+spark_write_parquet(urology_icd_rules_qs, path = 's3a://pgxdatalake/association_rules_icd/urology', mode = "overwrite", skipNul = TRUE)
+
+
+```
+
+```{r Render-Markdown, include=FALSE, eval=FALSE, cache=TRUE}
+
+library(quarto)
+
+quarto_render("urology_FpGrowth.qmd")
+
+
+```
+
+```{sh Copy-Rmarkdown, include=FALSE, eval=FALSE}
+
+# Save to AWS S3 for web hosting
+
+aws s3 cp /home/jdixon/Urology/urology_FpGrowth.html s3://plotly-demo/ 
+
+aws s3 cp /home/jdixon/Urology/urology_network.html s3://plotly-demo/ 
+
+     
+```
+
+```{sh Update-EDA-Script, include=FALSE, eval=FALSE}
+
+# Copies EDA to EMR Setup Bootstrap Script For Next EMR Cluster Build
+aws s3 cp /home/jdixon/Urology/urology_FpGrowth.qmd s3://pgx-terraform/code/ 
+
+
+```
